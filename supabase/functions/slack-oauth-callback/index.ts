@@ -61,7 +61,7 @@ Deno.serve(async (req: Request) => {
     const tokenData = await tokenResponse.json();
 
     if (!tokenData.ok) {
-      console.error("Slack OAuth error:", tokenData);
+      console.error("Slack OAuth error (full response):", tokenData);
       return new Response(
         JSON.stringify({ error: "Failed to authenticate with Slack" }),
         {
@@ -71,10 +71,50 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    // Normalize token/team/webhook fields (handle variations in Slack's response)
+    const accessToken = tokenData.access_token ?? tokenData.authed_user?.access_token ?? null;
+    const teamId = tokenData.team?.id ?? tokenData.team_id ?? null;
+    const teamName = tokenData.team?.name ?? tokenData.team_name ?? null;
+    const incomingWebhookUrl = tokenData.incoming_webhook?.url ?? tokenData.incoming_webhook_url ?? null;
+    const incomingWebhookChannel = tokenData.incoming_webhook?.channel ?? tokenData.incoming_webhook?.channel_id ?? null;
+
+    // Diagnostic logging (do NOT log secret tokens in production)
+    console.log("Slack tokenData fields:", {
+      hasAccessToken: !!accessToken,
+      hasTeamId: !!teamId,
+      hasIncomingWebhook: !!incomingWebhookUrl,
+    });
+
+    if (!accessToken) {
+      console.error("No access token found in Slack response", tokenData);
+      // still proceed if desired, but usually the token is required to use Slack APIs
+      // return an error so it's obvious to the user/devs
+      return new Response(
+        JSON.stringify({ error: "Slack did not return an access token" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // Ensure service role key is present (we need it to write to profiles)
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!serviceRoleKey) {
+      console.error("Missing SUPABASE_SERVICE_ROLE_KEY");
+      return new Response(
+        JSON.stringify({ error: "Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing" }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
     // Update user profile with Slack tokens
     const supabaseClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+      serviceRoleKey
     );
 
     const userId = state; // state contains the user ID
@@ -82,11 +122,11 @@ Deno.serve(async (req: Request) => {
     const { error: updateError } = await supabaseClient
       .from("profiles")
       .update({
-        slack_access_token: tokenData.access_token,
-        slack_team_id: tokenData.team.id,
-        slack_team_name: tokenData.team.name,
-        slack_channel: tokenData.incoming_webhook?.channel || null,
-        slack_webhook_url: tokenData.incoming_webhook?.url || null,
+        slack_access_token: accessToken,
+        slack_team_id: teamId,
+        slack_team_name: teamName,
+        slack_channel: incomingWebhookChannel ?? null,
+        slack_webhook_url: incomingWebhookUrl ?? null,
         slack_connected_at: new Date().toISOString(),
       })
       .eq("id", userId);
@@ -94,7 +134,7 @@ Deno.serve(async (req: Request) => {
     if (updateError) {
       console.error("Database update error:", updateError);
       return new Response(
-        JSON.stringify({ error: "Failed to save Slack connection" }),
+        JSON.stringify({ error: "Failed to save Slack connection", details: updateError }),
         {
           status: 500,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
